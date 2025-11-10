@@ -1,0 +1,18 @@
+
+camera_id: "cam01"
+fps: 30
+bed_polygon:
+  - [640, 360]
+  - [1280, 360]
+  - [1280, 720]
+  - [640, 720]
+thresholds:
+  d1_safe_min: 60
+  d2_edge: 45
+  T1_heads_up: 8
+  T2_alert: 18
+  cooldown_sec: 45
+risk_profile: "standard"
+display:
+  draw_polygons: true
+  draw_text: true
