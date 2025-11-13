@@ -1,123 +1,194 @@
+import argparse
+import time
+from pathlib import Path
 
-#!/usr/bin/env python3
-import sys, time, argparse, yaml
-import gi
-gi.require_version('Gst', '1.0')
-gi.require_version('GObject', '2.0')
-from gi.repository import Gst, GObject
-import pyds
-from src.zone_logic import ZoneMonitor, ZoneConfig, Thresholds
-Gst.init(None)
-PERSON_CLASS_ID = 0
-def load_zone_cfg(path: str) -> ZoneConfig:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    th = cfg.get("thresholds", {})
-    thresholds = Thresholds(
-        d1_safe_min=th.get("d1_safe_min", 60.0),
-        d2_edge=th.get("d2_edge", 45.0),
-        T1_heads_up=th.get("T1_heads_up", 8.0),
-        T2_alert=th.get("T2_alert", 18.0),
-        cooldown_sec=th.get("cooldown_sec", 45.0),
+import cv2
+import numpy as np
+
+from src.zone_logic_simple import load_zone_config, SimpleZoneMonitor
+from src.storage import write_status, append_timeline_row
+
+
+def detect_person_bboxes(frame):
+    """
+    ⚠️ 임시 예시용 사람 검출 함수.
+    지금은 화면 중앙에 대충 하나의 박스를 만든다.
+    실제 사용할 때는 네 프로토타입의 사람 검출 결과로 교체하면 된다.
+
+    반환 형식: [(x, y, w, h), ...]
+    """
+    h, w = frame.shape[:2]
+    bw = int(w * 0.25)
+    bh = int(h * 0.45)
+    x = w // 2 - bw // 2
+    y = h // 2 - bh // 2
+    return [(x, y, bw, bh)]
+
+
+def draw_bed_polygon(frame, bed_polygon, color=(0, 255, 255), thickness=2):
+    """
+    침대 영역(bed_polygon)을 화면에 선으로 표시 (디버깅/설명용)
+    """
+    pts = np.array(bed_polygon, dtype=np.int32)
+    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Zone1(엣지 근처)만 위험구역으로 사용하는 단순 모니터"
     )
-    bed_poly = [(float(x), float(y)) for x, y in cfg["bed_polygon"]]
-    return ZoneConfig(bed_polygon=bed_poly, thresholds=thresholds)
-def make_source_bin(index: int, uri: str):
-    bin_name = f"source-bin-{index}"
-    nbin = Gst.Bin.new(bin_name)
-    if uri.startswith(("rtsp://","rtmp://")):
-        src = Gst.ElementFactory.make("rtspsrc", f"rtsp-src-{index}")
-        src.set_property("latency", 200)
-        depay = Gst.ElementFactory.make("rtph264depay", f"depay-{index}")
-        h264parse = Gst.ElementFactory.make("h264parse", f"h264parse-{index}")
-        decoder = Gst.ElementFactory.make("nvv4l2decoder", f"decoder-{index}")
-        for el in (src, depay, h264parse, decoder): nbin.add(el)
-        src.connect("pad-added", lambda src, pad: pad.link(depay.get_static_pad("sink")))
-        depay.link(h264parse); h264parse.link(decoder)
-        nbin.add_pad(Gst.GhostPad.new("src", decoder.get_static_pad("src")))
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="0",
+        help="영상 소스: '0'이면 웹캠, 그 외에는 영상 파일 경로",
+    )
+    parser.add_argument(
+        "--zones",
+        type=str,
+        default="configs/zones/minimal_room.yaml",
+        help="침대/임계 설정 YAML 경로",
+    )
+    parser.add_argument(
+        "--display",
+        type=int,
+        default=1,
+        help="1이면 화면 표시(cv2.imshow), 0이면 표시 안 함",
+    )
+    parser.add_argument(
+        "--output_status",
+        type=str,
+        default="output/status.json",
+        help="현재 상태를 저장할 JSON 경로",
+    )
+    parser.add_argument(
+        "--output_timeline",
+        type=str,
+        default="output/timeline.csv",
+        help="타임라인 로그 CSV 경로",
+    )
+    return parser.parse_args()
+
+
+def open_capture(source: str):
+    """
+    source가 '0', '1' 같은 숫자면 웹캠, 아니면 영상 파일로 연다.
+    """
+    if source.isdigit():
+        cap = cv2.VideoCapture(int(source))
     else:
-        src = Gst.ElementFactory.make("filesrc", f"file-src-{index}")
-        src.set_property("location", uri)
-        demux = Gst.ElementFactory.make("qtdemux", f"demux-{index}")
-        h264parse = Gst.ElementFactory.make("h264parse", f"h264parse-{index}")
-        decoder = Gst.ElementFactory.make("nvv4l2decoder", f"decoder-{index}")
-        for el in (src, demux, h264parse, decoder): nbin.add(el)
-        src.link(demux)
-        demux.connect("pad-added", lambda demux, pad: pad.link(h264parse.get_static_pad("sink")))
-        h264parse.link(decoder)
-        nbin.add_pad(Gst.GhostPad.new("src", decoder.get_static_pad("src")))
-    return nbin
-def osd_sink_pad_buffer_probe(pad, info, u_data):
-    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(info.get_buffer()))
-    l_frame = batch_meta.frame_meta_list
-    zm = u_data["zone_monitor"]; fps_hint = u_data["fps_hint"]
-    cam_id = u_data["camera_id"]; http_ep = u_data.get("alert_http")
-    from src.alerts import console_alert, http_alert
-    while l_frame is not None:
-        try: frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-        except StopIteration: break
-        l_obj = frame_meta.obj_meta_list
-        while l_obj is not None:
-            try: obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-            except StopIteration: break
-            if obj_meta.class_id == u_data["person_class_id"]:
-                left = obj_meta.rect_params.left; top = obj_meta.rect_params.top
-                width = obj_meta.rect_params.width; height = obj_meta.rect_params.height
-                bottom_center = (left + width * 0.5, top + height)
-                track_id = obj_meta.object_id; now = time.time()
-                event = zm.update(track_id, bottom_center, (width, height), now, fps_hint=fps_hint)
-                if event:
-                    state, level = event; detail = f"state={state}, bc={bottom_center}"
-                    console_alert(cam_id, track_id, level, detail)
-                    if http_ep: http_alert(http_ep, cam_id, track_id, level, detail)
-            try: l_obj = l_obj.next
-            except StopIteration: break
-        try: l_frame = l_frame.next
-        except StopIteration: break
-    return Gst.PadProbeReturn.OK
-def build_pipeline(args, zm: ZoneMonitor):
-    pipeline = Gst.Pipeline.new("bedwatch-pipe")
-    srcbin = make_source_bin(0, args.source)
-    streammux = Gst.ElementFactory.make("nvstreammux", "stream-muxer")
-    streammux.set_property("batch-size", 1); streammux.set_property("width", 1280); streammux.set_property("height", 720)
-    pgie = Gst.ElementFactory.make("nvinfer", "primary-infer"); pgie.set_property("config-file-path", args.pgie_config)
-    tracker = Gst.ElementFactory.make("nvtracker", "tracker"); tracker.set_property("ll-config-file", args.tracker_config)
-    nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
-    sink = Gst.ElementFactory.make("nveglglessink" if args.display else "fakesink", "sink")
-    for el in [streammux, pgie, tracker, nvosd, sink]:
-        if not el: raise RuntimeError("DeepStream element create failed")
-    for el in (srcbin, streammux, pgie, tracker, nvosd, sink): pipeline.add(el)
-    sinkpad = streammux.get_request_pad("sink_0"); srcpad = srcbin.get_static_pad("src"); srcpad.link(sinkpad)
-    streammux.link(pgie); pgie.link(tracker); tracker.link(nvosd); nvosd.link(sink)
-    osd_sink_pad = nvosd.get_static_pad("sink"); 
-    appctx = {"zone_monitor": zm,"camera_id": "cam01","fps_hint": args.fps,"person_class_id": PERSON_CLASS_ID,"alert_http": args.alert_http}
-    osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, appctx)
-    return pipeline
+        cap = cv2.VideoCapture(source)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"영상/카메라를 열 수 없습니다: {source}")
+    return cap
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", required=True)
-    parser.add_argument("--zones", required=True)
-    parser.add_argument("--pgie-config", default="deepstream_configs/pgie_peoplenet_config.txt")
-    parser.add_argument("--tracker-config", default="deepstream_configs/tracker_config.txt")
-    parser.add_argument("--display", type=int, default=1)
-    parser.add_argument("--fps", type=float, default=30.0)
-    parser.add_argument("--alert-http", default=None)
-    args = parser.parse_args()
-    from src.zone_logic import ZoneMonitor
-    zcfg = load_zone_cfg(args.zones); zm = ZoneMonitor(zcfg)
-    pipeline = build_pipeline(args, zm)
-    loop = GObject.MainLoop(); bus = pipeline.get_bus(); bus.add_signal_watch()
-    def on_message(bus, msg):
-        t = msg.type
-        if t == Gst.MessageType.ERROR:
-            err, dbg = msg.parse_error(); print("[ERROR]", err, dbg, file=sys.stderr); loop.quit()
-        elif t == Gst.MessageType.EOS:
-            loop.quit()
-    bus.connect("message", on_message)
-    print("[INFO] starting pipeline..."); pipeline.set_state(Gst.State.PLAYING)
-    try: loop.run()
-    except KeyboardInterrupt: pass
-    finally:
-        pipeline.set_state(Gst.State.NULL); print("[INFO] stopped.")
+    args = parse_args()
+
+    # 1) 설정 로드 (bed_polygon, d2_edge, T_alert 등)
+    cfg = load_zone_config(args.zones)
+    monitor = SimpleZoneMonitor(cfg)
+
+    # 2) 영상/카메라 열기
+    cap = open_capture(args.source)
+
+    # FPS 추정 (설정값과 다를 수 있음)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = cfg.fps  # YAML에 적어둔 fps 사용
+    print(f"[INFO] Using FPS = {fps:.2f}")
+
+    prev_time = time.time()
+    cam_id = cfg.camera_id
+    track_id = 1  # 단일 대상이라고 가정
+
+    # 출력 디렉토리 생성
+    Path(args.output_status).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output_timeline).parent.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[INFO] 영상 끝 또는 프레임 읽기 실패, 종료합니다.")
+            break
+
+        now = time.time()
+        dt = now - prev_time
+        prev_time = now
+
+        # 3) 사람 검출 (현재는 임시 더미 → 여기만 네 프로토타입 함수로 교체)
+        bboxes = detect_person_bboxes(frame)
+
+        # 4) 각 사람에 대해 Zone1 모니터 업데이트
+        for bbox in bboxes:
+            res = monitor.update(bbox, dt=dt)
+
+            # 색상 결정
+            if res["level"] == "SAFE":
+                color = (0, 255, 0)       # 초록
+            elif res["level"] == "PREFALL_SHORT":
+                color = (0, 255, 255)     # 노랑(임계 미만 Zone1)
+            else:
+                color = (0, 0, 255)       # 빨강(임계 이상 Zone1)
+
+            x, y, w, h = map(int, bbox)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+            label = f"{res['level']} {res['dwell']:.1f}s"
+            cv2.putText(
+                frame,
+                label,
+                (x, max(0, y - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+            # 5) 상태/타임라인 파일 기록
+            try:
+                # prefall: Zone1 안인지 여부 (in_zone1)
+                write_status(
+                    args.output_status,
+                    cam_id,
+                    track_id,
+                    res.get("in_zone1", False),
+                    res.get("dwell", 0.0),
+                )
+            except Exception as e:
+                print(f"[WARN] write_status 실패: {e}")
+
+            try:
+                append_timeline_row(
+                    args.output_timeline,
+                    cam_id,
+                    track_id,
+                    res.get("in_zone1", False),
+                    res.get("dwell", 0.0),
+                )
+            except Exception as e:
+                print(f"[WARN] append_timeline_row 실패: {e}")
+
+        # 6) 침대 폴리곤 시각화 (디버깅용)
+        try:
+            draw_bed_polygon(frame, cfg.bed_polygon)
+        except Exception as e:
+            print(f"[WARN] 침대 폴리곤 그리기 실패: {e}")
+
+        # 7) 화면 표시
+        if args.display:
+            cv2.imshow("Zone1 Monitor", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                print("[INFO] 'q' 입력으로 종료합니다.")
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 if __name__ == "__main__":
     main()
